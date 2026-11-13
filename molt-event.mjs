@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, sign, verify as verifySignature } from 'node:crypto';
 import { appendFile, readFile } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -118,32 +118,65 @@ async function readLedger(path) {
   try {
     bytes = await readFile(path);
   } catch (error) {
-    if (error && typeof error === 'object' && error.code === 'ENOENT') return { bytes: Buffer.alloc(0), count: 0, lastHash: ZERO_HASH };
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return { bytes: Buffer.alloc(0), count: 0, lastHash: ZERO_HASH, publicHex: null };
     fail(`Unable to read ledger file: ${path}`);
   }
 
   const text = decodeUtf8(bytes, 'Ledger file');
-  let count = 0;
+  if (text !== '' && !text.endsWith('\n')) fail('Ledger file is not newline-terminated.');
+  const lines = text === '' ? [] : text.slice(0, -1).split('\n');
   let lastHash = ZERO_HASH;
-  for (const line of text.split('\n')) {
-    if (/^[\u0020\u0009\u000d]*$/.test(line)) continue;
+  let ledgerPublicHex = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const label = `Ledger event on line ${index + 1}`;
     let event;
     try {
-      canonicalizeJsonText(line);
       event = JSON.parse(line);
     } catch {
-      fail(`Ledger contains invalid JSON on non-empty line ${count + 1}.`);
+      fail(`Ledger contains invalid JSON on line ${index + 1}.`);
     }
-    if (!event || typeof event !== 'object' || Array.isArray(event) || !Object.hasOwn(event, 'hash')) {
-      fail(`Ledger event on non-empty line ${count + 1} does not have a hash field.`);
+    if (!event || typeof event !== 'object' || Array.isArray(event)) fail(`${label} is not an object.`);
+    if (canonicalizeJsonText(line) !== line) fail(`${label} is not canonical.`);
+
+    const fields = ['seq', 'ts', 'type', 'actor', 'payload', 'prev_hash', 'pub', 'sig', 'hash'];
+    if (Object.keys(event).length !== fields.length || !fields.every(field => Object.hasOwn(event, field))) {
+      fail(`${label} does not have the exact Camp 1 fields.`);
     }
-    if (typeof event.hash !== 'string' || !HEX_32.test(event.hash)) {
-      fail(`Ledger event on non-empty line ${count + 1} has an invalid hash field.`);
+    if (event.seq !== index || !Number.isSafeInteger(event.ts) || event.ts < 0
+        || typeof event.type !== 'string' || typeof event.actor !== 'string'
+        || typeof event.prev_hash !== 'string' || !HEX_32.test(event.prev_hash)
+        || typeof event.pub !== 'string' || !HEX_32.test(event.pub)
+        || typeof event.sig !== 'string' || !/^[0-9a-f]{128}$/.test(event.sig)
+        || typeof event.hash !== 'string' || !HEX_32.test(event.hash)) {
+      fail(`${label} has invalid Camp 1 field formats.`);
     }
-    count += 1;
-    lastHash = event.hash;
+    if (event.prev_hash !== lastHash) fail(`${label} has a broken hash chain.`);
+
+    const body = { seq: event.seq, ts: event.ts, type: event.type, payload: event.payload, actor: event.actor };
+    const canonicalBody = canonicalizeJsonText(JSON.stringify(body));
+    const recomputedHash = createHash('sha256').update(`${lastHash}${canonicalBody}`, 'utf8').digest('hex');
+    if (event.hash !== recomputedHash) fail(`${label} does not use the Camp 1 hash scheme.`);
+
+    let signatureIsValid = false;
+    try {
+      const publicKey = createPublicKey({
+        key: Buffer.concat([PUBLIC_PREFIX, Buffer.from(event.pub, 'hex')]),
+        format: 'der',
+        type: 'spki',
+      });
+      signatureIsValid = verifySignature(null, Buffer.from(recomputedHash, 'hex'), publicKey, Buffer.from(event.sig, 'hex'));
+    } catch {
+      signatureIsValid = false;
+    }
+    if (!signatureIsValid) fail(`${label} has an invalid Camp 1 signature.`);
+    if (ledgerPublicHex !== null && event.pub !== ledgerPublicHex) fail(`${label} uses a different public key; one MOLT package must use one ledger key.`);
+    ledgerPublicHex = event.pub;
+    lastHash = recomputedHash;
   }
-  return { bytes, count, lastHash };
+
+  return { bytes, count: lines.length, lastHash, publicHex: ledgerPublicHex };
 }
 
 async function readPayload(path) {
@@ -163,26 +196,32 @@ async function readStdin() {
   return Buffer.concat(chunks);
 }
 
+export function buildEvent({ seq, ts, type, actor, payload, prevHash, publicHex, privateKey }) {
+  const body = { seq, ts, type, payload, actor };
+  const canonicalBody = canonicalizeJsonText(JSON.stringify(body));
+  const hash = createHash('sha256').update(`${prevHash}${canonicalBody}`, 'utf8').digest('hex');
+  const sig = sign(null, Buffer.from(hash, 'hex'), privateKey).toString('hex');
+  return { seq, ts, type, actor, payload, prev_hash: prevHash, pub: publicHex, sig, hash };
+}
+
 async function main(argv) {
   const options = parseArgs(argv);
   const ledgerPath = options.get('--ledger');
   const ledger = await readLedger(ledgerPath);
   const { privateKey, publicHex } = await readIdentity(options.get('--key'));
+  if (ledger.publicHex !== null && ledger.publicHex !== publicHex) fail('Signing key does not match the existing MOLT package ledger key.');
   const payload = await readPayload(options.get('--payload'));
 
-  const body = {
+  const fullEvent = buildEvent({
     seq: ledger.count,
     ts: Math.floor(Date.now() / 1000),
     type: options.get('--type'),
     actor: options.get('--actor'),
     payload,
-    prev_hash: ledger.lastHash,
-    pub: publicHex,
-  };
-  const canonicalBody = canonicalizeJsonText(JSON.stringify(body));
-  const hash = createHash('sha256').update(`${ledger.lastHash}${canonicalBody}`, 'utf8').digest('hex');
-  const signature = sign(null, Buffer.from(canonicalBody, 'utf8'), privateKey).toString('hex');
-  const fullEvent = { ...body, sig: signature, hash };
+    prevHash: ledger.lastHash,
+    publicHex,
+    privateKey,
+  });
   const canonicalEvent = canonicalizeJsonText(JSON.stringify(fullEvent));
   const separator = ledger.bytes.length > 0 && ledger.bytes[ledger.bytes.length - 1] !== 0x0a ? '\n' : '';
 

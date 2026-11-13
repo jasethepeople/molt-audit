@@ -358,7 +358,7 @@ export class AuditLedger {
   private async appendEvent(
     type: string,
     payload: unknown,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<Record<string, unknown> & { type: string; payload: unknown }> {
     const body = {
       seq: this.nextSeq,
       ts: Math.floor(Date.now() / 1000),

@@ -23,3 +23,9 @@
 
 ## Expected build/test commands
 
+
+## Camp 1 interoperability update
+
+- The companion `molt-event.mjs` now uses the same five-field hash preimage and signature-over-hash-bytes scheme as the gateway audit ledger and `molt-verify`.
+- A regression test builds a package with the standalone writer and verifies it with the L1 package verifier.
+- `npm test`: 14 passed; `npm run typecheck`: passed.
