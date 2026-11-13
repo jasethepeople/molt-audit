@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { promisify } from 'node:util';
 import {
   chmod,
@@ -20,6 +21,7 @@ import type { ExecuteRequest } from '../src/types.js';
 import { verifyMoltPackage } from '../verifier.mjs';
 
 const execFileAsync = promisify(execFile);
+const eventWriterPath = new URL('../molt-event.mjs', import.meta.url);
 const roots: string[] = [];
 
 async function makeRoot(): Promise<string> {
@@ -99,6 +101,41 @@ afterEach(async () => {
 });
 
 describe('gateway audit ledger', () => {
+  it('standalone event writer emits a Camp 1 package accepted by the L1 verifier', async () => {
+    const root = await makeRoot();
+    const packageDir = path.join(root, 'package');
+    await mkdir(packageDir);
+    const pair = generateKeyPairSync('ed25519');
+    const privateHex = Buffer.from(pair.privateKey.export({ format: 'der', type: 'pkcs8' })).subarray(-32).toString('hex');
+    const publicHex = Buffer.from(pair.publicKey.export({ format: 'der', type: 'spki' })).subarray(-32).toString('hex');
+    const identityPath = path.join(root, 'identity.json');
+    const payloadPath = path.join(root, 'payload.json');
+    const ledgerPath = path.join(packageDir, 'events.jsonl');
+
+    await writeFile(identityPath, JSON.stringify({ 'manifest-signer': { priv: privateHex, pub: publicHex } }), { mode: 0o600 });
+    await writeFile(payloadPath, JSON.stringify({ source: 'molt-audit', ok: true }));
+    await execFileAsync(process.execPath, [
+      eventWriterPath.pathname,
+      '--key', identityPath,
+      '--ledger', ledgerPath,
+      '--type', 'integration.test',
+      '--actor', 'agent',
+      '--payload', payloadPath,
+    ]);
+
+    const ledger = await readFile(ledgerPath);
+    await writeFile(path.join(packageDir, 'ed25519-public.pem'), pair.publicKey.export({ format: 'pem', type: 'spki' }));
+    await writeFile(path.join(packageDir, 'manifest.json'), JSON.stringify({
+      artifacts: {},
+      artifact_bytes: {},
+      agent_pubkeys: { agent: publicHex },
+      ledger_bytes: ledger.byteLength,
+    }));
+
+    const verification = await verifyMoltPackage(packageDir);
+    expect(verification.valid).toBe(true);
+  });
+
   it('logs an allowed execution and verifies VALID with the L1 verifier', async () => {
     const root = await makeRoot();
     const router = new Router(root, { loader: loaderReturning({ ok: true }) });
